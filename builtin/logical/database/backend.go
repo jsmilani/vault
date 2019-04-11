@@ -268,8 +268,6 @@ func (b *databaseBackend) GetConnection(ctx context.Context, s logical.Storage, 
 // a go-routine, and does not wait for success or failure of it's tasks before
 // returning. This is to avoid blocking the mount process while loading and
 // evaluating existing roles, etc.
-//
-// TODO: verify initQueue results and/or active queue in periodic func
 func (b *databaseBackend) initQueue(ctx context.Context, conf *logical.BackendConfig) {
 	// verify this mount is on the primary server, or is a local mount. If not, do
 	// not create a queue or launch a ticker
@@ -277,15 +275,17 @@ func (b *databaseBackend) initQueue(ctx context.Context, conf *logical.BackendCo
 	if (conf.System.LocalMount() || !replicationState.HasState(consts.ReplicationPerformanceSecondary)) &&
 		!replicationState.HasState(consts.ReplicationDRSecondary) &&
 		!replicationState.HasState(consts.ReplicationPerformanceStandby) {
-		b.Logger().Info("backed is running on primary server or is a local mount, initializing database rotation queue")
+		b.Logger().Info("initializing database rotation queue")
 
+		b.Lock()
 		if b.credRotationQueue == nil {
 			b.credRotationQueue = queue.NewTimeQueue()
 		}
+		b.Unlock()
 
 		// read, process WAL logs, log any errors
 		if err := b.queueWAL(ctx, conf); err != nil {
-			b.Logger().Warn("error loading WAL entries into queue", err)
+			b.Logger().Warn("error(s) loading WAL entries into queue", err)
 		}
 
 		// load roles and populate queue
@@ -304,7 +304,7 @@ func itemFromWal(ctx context.Context, conf *logical.BackendConfig, walID string)
 // queueWAL reads WAL entries at backend initialization. If WAL entries for
 // static account rotation are round, attempt to re-set the password for the
 // role given the NewPassword stored in the WAL. If the matching Role does not
-// exist, the Role's LastVaultRotation is newer than the WAL,  or the Role does
+// exist, the Role's LastVaultRotation is newer than the WAL, or the Role does
 // not have a static account, delete the WAL.
 func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendConfig) error {
 	keys, err := framework.ListWAL(ctx, conf.StorageView)
@@ -345,10 +345,11 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 		if role.StaticAccount.LastVaultRotation.After(walEntry.LastVaultRotation) {
 			// role password has been rotated since the WAL was created, so let's
 			// delete this
-			err = framework.DeleteWAL(ctx, conf.StorageView, walID)
-			if err != nil {
+			if err = framework.DeleteWAL(ctx, conf.StorageView, walID); err != nil {
+				b.Logger().Warn("error deleting WAL for role with newer rotation date", err)
 				merr = multierror.Append(merr, err)
 			}
+			continue
 		}
 
 		// veryify role is still in Allowed Roles
@@ -371,70 +372,18 @@ func (b *databaseBackend) queueWAL(ctx context.Context, conf *logical.BackendCon
 			}
 		}
 
-		// WAL walEntry's LastVaultRotation is newer, so we attempt to set NewPassword
-		// again on the database user, then update Vault storage
-		{
-			db, err := b.GetConnection(ctx, conf.StorageView, role.DBName)
-			if err != nil {
-				b.Logger().Warn("error getting database connection", err)
-				err = framework.DeleteWAL(ctx, conf.StorageView, walID)
-				if err != nil {
-					b.Logger().Warn("error deleting WAL", err)
-				}
-				continue
-			}
-
-			db.RLock()
-			defer db.RUnlock()
-
-			config := dbplugin.StaticUserConfig{
-				Username: role.StaticAccount.Username,
-				Password: walEntry.NewPassword,
-			}
-
-			_, _, _, err = db.SetCredentials(ctx, config, role.Statements.Rotation)
-			if err != nil {
-				b.Logger().Warn("error setting new password from WAL", err)
-				// Add back on to queue with WALID
-				if err := b.credRotationQueue.PushItem(&queue.Item{
-					Key:   walEntry.RoleName,
-					Value: walEntry.ID,
-					// add a backoff
-					Priority: role.StaticAccount.LastVaultRotation.Add(time.Second * 10).Unix(),
-				}); err != nil {
-					b.Logger().Warn("error pushing item back on to queue", err)
-				}
-				continue
-			}
-		}
-
-		// Store updated role information
-		role.StaticAccount.LastVaultRotation = time.Now()
-		role.StaticAccount.Password = walEntry.NewPassword
-
-		roleEntry, err := logical.StorageEntryJSON("role/"+walEntry.RoleName, role)
+		// WAL walEntry's LastVaultRotation is newer, so we call
+		// createUpdateStaticAccount which will attempt to set the password and
+		// delete the WAL if successful
+		_, err = b.createUpdateStaticAccount(ctx, conf.StorageView, &setPasswordInput{
+			RoleName: walEntry.RoleName,
+			Role:     role,
+			WALID:    walID,
+			Password: walEntry.NewPassword,
+		})
 		if err != nil {
 			merr = multierror.Append(merr, err)
 			continue
-		}
-		if err := conf.StorageView.Put(ctx, roleEntry); err != nil {
-			merr = multierror.Append(merr, err)
-			b.Logger().Warn("error storing updated Role restored from WAL", err)
-			// Add back on to queue with WALID
-			if err := b.credRotationQueue.PushItem(&queue.Item{
-				Key:   walEntry.RoleName,
-				Value: walID,
-				// add a backoff
-				Priority: role.StaticAccount.LastVaultRotation.Add(time.Second * 10).Unix(),
-			}); err != nil {
-				b.Logger().Warn("error pushing item back on to queue", err)
-			}
-			continue
-		}
-
-		// handle WAL
-		if err := framework.DeleteWAL(ctx, conf.StorageView, walID); err != nil {
-			merr = multierror.Append(merr, err)
 		}
 	}
 	return merr
@@ -530,6 +479,13 @@ func (b *databaseBackend) populateQueue(ctx context.Context, s logical.Storage) 
 		return
 	}
 
+	// guard against a nil queue
+	b.Lock()
+	if b.credRotationQueue == nil {
+		b.credRotationQueue = queue.NewTimeQueue()
+	}
+	b.Unlock()
+
 	for _, roleName := range roles {
 		select {
 		case <-ctx.Done():
@@ -547,10 +503,6 @@ func (b *databaseBackend) populateQueue(ctx context.Context, s logical.Storage) 
 			continue
 		}
 
-		// guard against a nil queue
-		if b.credRotationQueue == nil {
-			b.credRotationQueue = queue.NewTimeQueue()
-		}
 		if err := b.credRotationQueue.PushItem(&queue.Item{
 			Key:      roleName,
 			Priority: role.StaticAccount.LastVaultRotation.Add(role.StaticAccount.RotationPeriod).Unix(),

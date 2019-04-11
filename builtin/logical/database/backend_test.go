@@ -1619,7 +1619,7 @@ func TestBackend_Static_QueueWAL_discard_role_not_found(t *testing.T) {
 	config.StorageView = &logical.InmemStorage{}
 	config.System = sys
 
-	walID, err := framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
+	_, err := framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
 		RoleName: "doesnotexist",
 	})
 	if err != nil {
@@ -1724,7 +1724,8 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
 
-	time.Sleep(time.Second * 10)
+	// allow the first rotation to occur, setting LastVaultRotation
+	time.Sleep(time.Second * 12)
 
 	// cleanup the backend, then create a WAL for the role with a
 	// LastVaultRotation of 1 hour ago, so that when we recreate the backend the
@@ -1735,10 +1736,10 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 
 	// make a fake WAL entry with an older time
 	oldRotationTime := roleTime.Add(time.Hour * -1)
+	walPassword := "somejunkpassword"
 	_, err = framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
 		RoleName:          roleName,
-		NewPassword:       "strongpassword",
-		OldPassword:       "weakpassword",
+		NewPassword:       walPassword,
 		LastVaultRotation: oldRotationTime,
 	})
 	if err != nil {
@@ -1784,6 +1785,22 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 
 	if !lastVaultRotation.After(roleTime) {
 		t.Fatal("last vault rotation time not greater than role creation time")
+	}
+
+	// grab initial password to verify it doesn't change
+	req = &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/" + roleName,
+		Storage:   config.StorageView,
+	}
+	resp, err = b.HandleRequest(namespace.RootContext(nil), req)
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("err:%s resp:%#v\n", err, resp)
+	}
+
+	password := resp.Data["password"].(string)
+	if password == walPassword {
+		t.Fatalf("expected password to not be changed by WAL, but was")
 	}
 }
 
