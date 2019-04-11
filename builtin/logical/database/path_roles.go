@@ -10,7 +10,6 @@ import (
 	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
-	"github.com/y0ssar1an/q"
 )
 
 func pathListRoles(b *databaseBackend) *framework.Path {
@@ -114,8 +113,6 @@ func (b *databaseBackend) pathRoleExistenceCheck(ctx context.Context, req *logic
 	if err != nil {
 		return false, err
 	}
-	re := role != nil
-	q.Q("role exists:", re)
 	return role != nil, nil
 }
 
@@ -242,7 +239,6 @@ func (b *databaseBackend) pathRoleCreateUpdate(ctx context.Context, req *logical
 		role = &roleEntry{}
 		createRole = true
 	}
-	q.Q(createRole)
 
 	// Static Account information
 	if username, ok := data.Get("username").(string); ok && username != "" {

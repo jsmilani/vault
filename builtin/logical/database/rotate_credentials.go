@@ -112,7 +112,7 @@ func (b *databaseBackend) walForItemValue(ctx context.Context, s logical.Storage
 		return nil
 	}
 
-	if wal != nil || wal.Kind != walRotationKey {
+	if wal == nil || wal.Kind != walRotationKey {
 		return nil
 	}
 
@@ -232,7 +232,7 @@ func (b *databaseBackend) createUpdateStaticAccount(ctx context.Context, s logic
 	}
 
 	// cleanup WAL after successfully rotating and pushing new item on to queue
-	if err := framework.DeleteWAL(ctx, s, input.WALID); err != nil {
+	if err := framework.DeleteWAL(ctx, s, setResponse.WALID); err != nil {
 		merr = multierror.Append(merr, err)
 	}
 

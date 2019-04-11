@@ -1619,7 +1619,7 @@ func TestBackend_Static_QueueWAL_discard_role_not_found(t *testing.T) {
 	config.StorageView = &logical.InmemStorage{}
 	config.System = sys
 
-	_, err := framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
+	walID, err := framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
 		RoleName: "doesnotexist",
 	})
 	if err != nil {
@@ -1663,7 +1663,7 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 	config.StorageView = &logical.InmemStorage{}
 	config.System = sys
 
-	roleName := "testupdated"
+	roleName := "test-discard-by-date"
 	lb, err := Factory(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
@@ -1672,8 +1672,6 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 	if !ok {
 		t.Fatal("could not convert to db backend")
 	}
-	// manually clean up
-	// defer b.Cleanup(ctx)
 
 	cleanup, connURL := preparePostgresTestContainer(t, config.StorageView, b)
 	defer cleanup()
@@ -1708,8 +1706,6 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 		"creation_statements":   testRoleStaticCreate,
 		"rotation_statements":   testRoleStaticUpdate,
 		"revocation_statements": defaultRevocationSQL,
-		"default_ttl":           "5m",
-		"max_ttl":               "10m",
 		"username":              "statictest",
 		// low value here, to make sure the backend rotates this password at least
 		// once before we compare it to the WAL
@@ -1738,7 +1734,7 @@ func TestBackend_Static_QueueWAL_discard_role_newer_rotation_date(t *testing.T) 
 	time.Sleep(time.Second * 3)
 
 	// make a fake WAL entry with an older time
-	oldRotationTime := time.Now().Add(time.Hour * -1)
+	oldRotationTime := roleTime.Add(time.Hour * -1)
 	_, err = framework.PutWAL(ctx, config.StorageView, walRotationKey, &walSetCredentials{
 		RoleName:          roleName,
 		NewPassword:       "strongpassword",
