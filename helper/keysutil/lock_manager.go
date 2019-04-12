@@ -54,75 +54,61 @@ type PolicyRequest struct {
 }
 
 type LockManager struct {
-	cache    Cache
+	cache    atomic.Value
 	keyLocks []*locksutil.LockEntry
-	lock     sync.RWMutex
 }
 
 func NewLockManager(cacheDisabled bool) *LockManager {
-	// default cache type is either noop (no cache) or syncmap (unlimited cache)
-	// depending on the value of cacheDisabled
-	var cache Cache
-	if cacheDisabled {
-		cache = NewTransitNoOp()
-	} else {
-		cache = NewTransitSyncMap()
+	lm := &LockManager{
+		keyLocks: locksutil.CreateLocks(),
 	}
 
-	lm := &LockManager{
-		cache:    cache,
-		keyLocks: locksutil.CreateLocks(),
-		lock:     sync.RWMutex{},
+	// default cache type is either noop (no cache) or syncmap (unlimited cache)
+	// depending on the value of cacheDisabled
+	if cacheDisabled {
+		lm.cache.Store(NewTransitNoOp())
+	} else {
+		lm.cache.Store(NewTransitSyncMap())
 	}
 
 	return lm
 }
 
+// some convenience methods
 func (lm *LockManager) GetCacheSize() int {
-	lm.lock.RLock()
-	cacheSize := lm.cache.Size()
-	lm.lock.RUnlock()
-	return cacheSize
+	return lm.cache.Load().(Cache).Size()
 }
 
 func (lm *LockManager) SetCacheSize(size int) error {
 	// switching cache sizes is only possible for a LockManager that was created
-	// with a cache (ie. the cacheDisabled param passed to NewLockManager was false)
+	// with a cache (i.e. the cacheDisabled param passed to NewLockManager was false)
 
-	lm.lock.RLock()
-	cacheSize := lm.cache.Size()
-	lm.lock.RUnlock()
+	oldCache := lm.cache.Load().(Cache)
 
 	switch {
-	case lm.cache.CacheActive() == false:
+	case oldCache.CacheActive() == false:
 		return errors.New("cache is disabled")
 	case size < 0:
 		return errors.New("cache size must be greater or equal to zero")
-	case size == cacheSize:
+	case size == oldCache.Size():
 	case size == 0:
-		lm.lock.RLock()
-		lm.cache = NewTransitSyncMap()
-		lm.lock.RUnlock()
+		lm.cache.Store(NewTransitSyncMap())
 	case size > 0:
-		newCache, err := NewTransitLRU(size)
+		newLRUCache, err := NewTransitLRU(size)
 		if err != nil {
 			return errwrap.Wrapf("failed to create cache: {{err}}", err)
 		}
-		lm.lock.RLock()
-		lm.cache = newCache
-		lm.lock.RUnlock()
+		lm.cache.Store(newLRUCache)
 	}
 	return nil
 }
 
 func (lm *LockManager) InvalidatePolicy(name string) {
-	if lm.cache.CacheActive() == false {
+	cache := lm.cache.Load().(Cache)
+	if cache.CacheActive() == false {
 		return
 	}
-
-	lm.lock.RLock()
-	lm.cache.Delete(name)
-	lm.lock.RUnlock()
+	cache.Delete(name)
 }
 
 // RestorePolicy acquires an exclusive lock on the policy name and restores the
@@ -157,9 +143,8 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 	// If the policy is in cache and 'force' is not specified, error out. Anywhere
 	// that would put it in the cache will also be protected by the mutex above,
 	// so we don't need to re-check the cache later.
-	lm.lock.RLock()
-	pRaw, ok = lm.cache.Load(name)
-	lm.lock.RUnlock()
+	cache := lm.cache.Load().(Cache)
+	pRaw, ok = cache.Load(name)
 	if ok && !force {
 		return fmt.Errorf("key %q already exists", name)
 	}
@@ -220,9 +205,7 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 
 	keyData.Policy.l = new(sync.RWMutex)
 
-	lm.lock.RLock()
-	lm.cache.Store(name, keyData.Policy)
-	lm.lock.RUnlock()
+	cache.Store(name, keyData.Policy)
 
 	return nil
 }
@@ -230,10 +213,6 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 func (lm *LockManager) BackupPolicy(ctx context.Context, storage logical.Storage, name string) (string, error) {
 	var p *Policy
 	var err error
-
-	// Locked because lm.cache could change
-	lm.lock.RLock()
-	defer lm.lock.RUnlock()
 
 	// Backup writes information about when the backup took place, so we get an
 	// exclusive lock here
@@ -244,7 +223,8 @@ func (lm *LockManager) BackupPolicy(ctx context.Context, storage logical.Storage
 	var ok bool
 	var pRaw interface{}
 
-	pRaw, ok = lm.cache.Load(name)
+	cache := lm.cache.Load().(Cache)
+	pRaw, ok = cache.Load(name)
 	if ok {
 		p = pRaw.(*Policy)
 		p.l.Lock()
@@ -281,7 +261,8 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest) (retP *
 	var pRaw interface{}
 
 	// Check if it's in our cache. If so, return right away.
-	pRaw, ok = lm.cache.Load(req.Name)
+	cache := lm.cache.Load().(Cache)
+	pRaw, ok = cache.Load(req.Name)
 	if ok {
 		p = pRaw.(*Policy)
 		if atomic.LoadUint32(&p.deleted) == 1 {
@@ -302,7 +283,7 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest) (retP *
 		switch {
 		// If using the cache we always unlock, the caller locks the policy
 		// themselves
-		case lm.cache.CacheActive():
+		case cache.CacheActive():
 			lock.Unlock()
 
 		// If not using the cache, if we aren't returning a policy the caller
@@ -313,7 +294,7 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest) (retP *
 	}
 
 	// Check the cache again
-	pRaw, ok = lm.cache.Load(req.Name)
+	pRaw, ok = cache.Load(req.Name)
 	if ok {
 		p = pRaw.(*Policy)
 		if atomic.LoadUint32(&p.deleted) == 1 {
@@ -406,8 +387,8 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest) (retP *
 			return nil, false, err
 		}
 
-		if lm.cache.CacheActive() {
-			lm.cache.Store(req.Name, p)
+		if cache.CacheActive() {
+			cache.Store(req.Name, p)
 		} else {
 			p.l = &lock.RWMutex
 			p.writeLocked = true
@@ -427,10 +408,8 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest) (retP *
 		}
 	}
 
-	lm.lock.RLock()
-	lm.cache.Store(req.Name, p)
-	lm.lock.RUnlock()
-	if !lm.cache.CacheActive() {
+	cache.Store(req.Name, p)
+	if !cache.CacheActive() {
 		p.l = &lock.RWMutex
 		p.writeLocked = true
 	}
@@ -453,7 +432,8 @@ func (lm *LockManager) DeletePolicy(ctx context.Context, storage logical.Storage
 	lock.Lock()
 	defer lock.Unlock()
 
-	pRaw, ok = lm.cache.Load(name)
+	cache := lm.cache.Load().(Cache)
+	pRaw, ok = cache.Load(name)
 	if ok {
 		p = pRaw.(*Policy)
 		p.l.Lock()
@@ -476,7 +456,7 @@ func (lm *LockManager) DeletePolicy(ctx context.Context, storage logical.Storage
 
 	atomic.StoreUint32(&p.deleted, 1)
 
-	lm.cache.Delete(name)
+	cache.Delete(name)
 
 	err = storage.Delete(ctx, "policy/"+name)
 	if err != nil {
